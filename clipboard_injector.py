@@ -1,81 +1,43 @@
 """
-Clipboard Injector & Win32 Atomic Paste Simulator — Antigravity Smart Voice Engine.
+Clipboard Injector & Honest Win32 SendInput Simulator — Antigravity Smart Voice Engine.
 
-Implements battle-tested Windows automation patterns (inspired by Microsoft PowerToys
-Advanced Paste & ShareX):
-  1. Explicit 64-bit Win32 GlobalAlloc / CF_HDROP handle safety.
-  2. Physical modifier-release guard (waits until user lifts fingers from Ctrl/CapsLock/F9/F10)
-     so physical KeyUp events NEVER cancel synthetic Ctrl+V and produce bare 'v' or 'ر'.
-  3. True 64-bit Win32 SendInput (40-byte INPUT struct) with deterministic settle intervals.
-  4. Foreground HWND verification so paste never lands on a background/helper window.
+Implements Gate-1 verified clipboard & input rules:
+  1. Centralized 64-bit Win32 prototypes with use_last_error=True (CB-04).
+  2. Strict HGLOBAL ownership transfer & cleanup on failure (CB-10).
+  3. Boolean modifier-release guard checking BOTH GetAsyncKeyState and hook _phys_down
+     (CB-02, R10): aborts paste (returns False) if modifiers remain held past timeout,
+     eliminating any residual window for bare 'v' / 'ر'.
+  4. Honest SendInput-only execution (CB-11, A3): lying void keybd_event fallback removed.
 """
 
 import ctypes
-from ctypes import wintypes
+import logging
 import os
 import time
-import logging
-from typing import Optional, Iterable
+from typing import Optional, Iterable, Callable
+
+from win32_api import (
+    user32,
+    kernel32,
+    DROPFILES,
+    INPUT,
+    KEYBDINPUT,
+    CF_UNICODETEXT,
+    CF_HDROP,
+    GHND,
+    GMEM_MOVEABLE,
+    INPUT_KEYBOARD,
+    KEYEVENTF_KEYUP,
+    get_process_exe_name,
+)
 
 logger = logging.getLogger("VoiceEngine")
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-
-ULONG_PTR = wintypes.WPARAM
-
-# -------------------------------------------------------------
-# 64-bit Windows Prototype Specifications
-# -------------------------------------------------------------
-kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
-
-kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
-kernel32.GlobalLock.restype = wintypes.LPVOID
-
-kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
-kernel32.GlobalUnlock.restype = wintypes.BOOL
-
-kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
-kernel32.GlobalFree.restype = wintypes.HGLOBAL
-
-user32.OpenClipboard.argtypes = [wintypes.HWND]
-user32.OpenClipboard.restype = wintypes.BOOL
-
-user32.EmptyClipboard.argtypes = []
-user32.EmptyClipboard.restype = wintypes.BOOL
-
-user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-user32.SetClipboardData.restype = wintypes.HANDLE
-
-user32.CloseClipboard.argtypes = []
-user32.CloseClipboard.restype = wintypes.BOOL
-
-user32.GetForegroundWindow.argtypes = []
-user32.GetForegroundWindow.restype = wintypes.HWND
-
-user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-user32.SetForegroundWindow.restype = wintypes.BOOL
-
-user32.IsWindow.argtypes = [wintypes.HWND]
-user32.IsWindow.restype = wintypes.BOOL
-
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-
-user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-user32.GetAsyncKeyState.restype = wintypes.SHORT
-
-CF_UNICODETEXT = 13
-CF_HDROP = 15
-GHND = 0x0042
-GMEM_MOVEABLE = 0x0002
-
-INPUT_KEYBOARD = 1
-KEYEVENTF_KEYUP = 0x0002
+# Named Engineering Constants (R6)
+PASTE_CTRL_SETTLE_SEC = 0.035
+PASTE_V_HOLD_SEC = 0.025
+PASTE_V_RELEASE_SETTLE_SEC = 0.020
+MODIFIER_RELEASE_DEBOUNCE_SEC = 0.015
 
 VK_CONTROL = 0x11
 VK_LCONTROL = 0xA2
@@ -96,7 +58,6 @@ SCAN_LCTRL = 0x1D
 SCAN_V = 0x2F
 SCAN_ENTER = 0x1C
 
-# Keys that must be physically released by the user before firing synthetic Ctrl+V
 GUARDED_RELEASE_VKS = (
     VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
     VK_MENU, VK_LMENU, VK_RMENU,
@@ -105,65 +66,8 @@ GUARDED_RELEASE_VKS = (
 )
 
 
-class DROPFILES(ctypes.Structure):
-    _fields_ = [
-        ("pFiles", wintypes.DWORD),
-        ("pt", wintypes.POINT),
-        ("fNC", wintypes.BOOL),
-        ("fWide", wintypes.BOOL),
-    ]
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
-
-
-class _INPUTunion(ctypes.Union):
-    _fields_ = [
-        ("mi", MOUSEINPUT),
-        ("ki", KEYBDINPUT),
-        ("hi", HARDWAREINPUT),
-    ]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("union", _INPUTunion),
-    ]
-
-
-user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-user32.SendInput.restype = wintypes.UINT
-
-
 def _send_key_input(vk: int, scan: int, key_up: bool = False) -> bool:
-    """Dispatches a single keyboard event via Win32 SendInput with full 64-bit struct alignment."""
+    """Dispatches a single keyboard event via Win32 SendInput (40-byte Win64 ABI)."""
     flags = KEYEVENTF_KEYUP if key_up else 0
     inp = INPUT(type=INPUT_KEYBOARD)
     inp.union.ki = KEYBDINPUT(
@@ -178,17 +82,15 @@ def _send_key_input(vk: int, scan: int, key_up: bool = False) -> bool:
 
 
 class ClipboardInjector:
-    """Handles native 64-bit Windows clipboard operations and race-free input simulation."""
+    """Handles native 64-bit Windows clipboard operations and honest SendInput paste."""
 
     @staticmethod
     def get_foreground_hwnd() -> int:
-        """Returns the HWND of the currently focused window (0 if none)."""
         hwnd = user32.GetForegroundWindow()
         return int(hwnd) if hwnd else 0
 
     @staticmethod
     def get_window_title(hwnd: int) -> str:
-        """Returns window title for a specific HWND."""
         if not hwnd:
             return ""
         length = user32.GetWindowTextLengthW(hwnd)
@@ -199,8 +101,11 @@ class ClipboardInjector:
         return buf.value
 
     @staticmethod
+    def get_window_exe_name(hwnd: int) -> str:
+        return get_process_exe_name(hwnd)
+
+    @staticmethod
     def get_foreground_window_title() -> str:
-        """Returns the title of the currently focused window."""
         return ClipboardInjector.get_window_title(ClipboardInjector.get_foreground_hwnd())
 
     @staticmethod
@@ -209,26 +114,55 @@ class ClipboardInjector:
         ignored_hwnds: Optional[Iterable[int]] = None,
     ) -> int:
         """
-        Ensures a valid target window owns focus before pasting.
-        Only restores fallback_hwnd if current foreground is 0 or an internal overlay window,
-        preserving focus if the user intentionally switched chat windows while speaking.
+        Returns the active foreground HWND, restoring fallback_hwnd only if focus shifted
+        to an internal overlay window. If foreground is 0 (e.g. UAC / Win+L Secure Desktop),
+        returns 0 so caller skips blind paste (HK-03 / DEC-03).
         """
         ignored = set(int(h) for h in (ignored_hwnds or ()) if h)
         cur_hwnd = ClipboardInjector.get_foreground_hwnd()
-        if cur_hwnd and cur_hwnd not in ignored:
+        if cur_hwnd == 0:
+            return 0
+        if cur_hwnd not in ignored:
             return cur_hwnd
 
         if fallback_hwnd and fallback_hwnd not in ignored and user32.IsWindow(fallback_hwnd):
             user32.SetForegroundWindow(fallback_hwnd)
             time.sleep(0.04)
-            return ClipboardInjector.get_foreground_hwnd() or fallback_hwnd
-        return cur_hwnd
+            new_fg = ClipboardInjector.get_foreground_hwnd()
+            if new_fg and new_fg not in ignored:
+                return new_fg
+        return 0
 
     @staticmethod
-    def wait_for_modifiers_release(timeout_ms: int = 450, extra_vks: Optional[Iterable[int]] = None) -> None:
+    def is_paste_allowed_for_process(
+        exe_name: str,
+        blocked_processes: Optional[Iterable[str]] = None,
+        allowed_processes: Optional[Iterable[str]] = None,
+    ) -> bool:
         """
-        Waits until the user physically releases hotkey modifiers (Ctrl, CapsLock, F9, F10, etc.).
-        Prevents physical KeyUp from racing with synthetic Ctrl+V and producing bare 'v' or 'ر'.
+        Evaluates target process against blocked/allowed lists (DEC-02, R5):
+          • Fail-open when exe_name == '' unless an explicit allowlist is configured.
+          • Blocks explorer.exe etc. to prevent copying audio files into folders.
+        """
+        norm_exe = (exe_name or "").strip().lower()
+        allowed_set = {p.strip().lower() for p in (allowed_processes or ()) if p and p.strip()}
+        blocked_set = {p.strip().lower() for p in (blocked_processes or ()) if p and p.strip()}
+
+        if allowed_set:
+            return bool(norm_exe) and (norm_exe in allowed_set)
+        if not norm_exe:
+            return True  # R5: Fail-open when process image query is denied by OS
+        return norm_exe not in blocked_set
+
+    @staticmethod
+    def wait_for_modifiers_release(
+        timeout_ms: int = 450,
+        extra_vks: Optional[Iterable[int]] = None,
+        phys_down_checker: Optional[Callable[[Iterable[int]], bool]] = None,
+    ) -> bool:
+        """
+        Waits until user physically lifts fingers from guarded modifiers & trigger keys.
+        Returns True when all keys are released, or False if still held at timeout (CB-02, R10).
         """
         vks = list(GUARDED_RELEASE_VKS)
         if extra_vks:
@@ -237,46 +171,42 @@ class ClipboardInjector:
                     vks.append(vk)
 
         deadline = time.monotonic() + (max(0, timeout_ms) / 1000.0)
-        while time.monotonic() < deadline:
-            any_down = any(bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in vks)
-            if not any_down:
-                # Extra 15ms debounce settle after finger lift
-                time.sleep(0.015)
-                return
+        while True:
+            os_down = any(bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in vks)
+            hook_down = bool(phys_down_checker(vks)) if phys_down_checker else False
+            if not os_down and not hook_down:
+                time.sleep(MODIFIER_RELEASE_DEBOUNCE_SEC)
+                return True
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(0.010)
 
     @staticmethod
     def set_clipboard_file(file_path: str) -> bool:
-        """
-        Places file in Windows Clipboard as CF_HDROP (file drop) and CF_UNICODETEXT.
-        Uses explicit 64-bit types to prevent handle truncation.
-        """
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             logger.error(f"Cannot set clipboard: file does not exist '{abs_path}'")
             return False
 
-        # Prepare CF_HDROP double-null-terminated wide string
         drop_bytes = (abs_path + "\0\0").encode("utf-16le")
         df = DROPFILES(pFiles=ctypes.sizeof(DROPFILES), fWide=True)
 
         total_drop_size = ctypes.sizeof(DROPFILES) + len(drop_bytes)
         h_drop = kernel32.GlobalAlloc(GHND, total_drop_size)
         if not h_drop:
-            logger.error("GlobalAlloc failed for CF_HDROP")
+            logger.error(f"GlobalAlloc failed for CF_HDROP (WinError={ctypes.get_last_error()})")
             return False
 
         p_drop = kernel32.GlobalLock(h_drop)
         if not p_drop:
             kernel32.GlobalFree(h_drop)
-            logger.error("GlobalLock failed for CF_HDROP")
+            logger.error(f"GlobalLock failed for CF_HDROP (WinError={ctypes.get_last_error()})")
             return False
 
         ctypes.memmove(p_drop, ctypes.byref(df), ctypes.sizeof(DROPFILES))
         ctypes.memmove(p_drop + ctypes.sizeof(DROPFILES), drop_bytes, len(drop_bytes))
         kernel32.GlobalUnlock(h_drop)
 
-        # Prepare CF_UNICODETEXT fallback
         text_bytes = (abs_path + "\0").encode("utf-16le")
         h_text = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(text_bytes))
         if h_text:
@@ -284,15 +214,17 @@ class ClipboardInjector:
             if p_text:
                 ctypes.memmove(p_text, text_bytes, len(text_bytes))
                 kernel32.GlobalUnlock(h_text)
+            else:
+                kernel32.GlobalFree(h_text)
+                h_text = None
 
-        # Open and set clipboard with retries and strict HGLOBAL ownership safety
         for _attempt in range(10):
             if user32.OpenClipboard(None):
                 try:
                     user32.EmptyClipboard()
                     res_drop = user32.SetClipboardData(CF_HDROP, h_drop)
                     if not res_drop:
-                        logger.error(f"SetClipboardData CF_HDROP failed: err={kernel32.GetLastError()}")
+                        logger.error(f"SetClipboardData CF_HDROP failed (WinError={ctypes.get_last_error()})")
                         kernel32.GlobalFree(h_drop)
                     if h_text:
                         res_text = user32.SetClipboardData(CF_UNICODETEXT, h_text)
@@ -306,70 +238,60 @@ class ClipboardInjector:
         kernel32.GlobalFree(h_drop)
         if h_text:
             kernel32.GlobalFree(h_text)
-        logger.error(f"Failed to open clipboard after retries: err={kernel32.GetLastError()}")
+        logger.error(f"Failed to open clipboard after retries (WinError={ctypes.get_last_error()})")
         return False
 
     @staticmethod
-    def simulate_paste(delay_ms: int = 120, extra_release_vks: Optional[Iterable[int]] = None) -> bool:
+    def simulate_paste(
+        delay_ms: int = 120,
+        extra_release_vks: Optional[Iterable[int]] = None,
+        phys_down_checker: Optional[Callable[[Iterable[int]], bool]] = None,
+    ) -> bool:
         """
-        Simulates Ctrl+V reliably across Arabic & English keyboard layouts and Electron/Chromium apps:
-          1. Waits for clipboard OS lock flush (delay_ms).
-          2. Waits until user physically lifts fingers from hotkey modifiers.
-          3. Sends LCTRL down -> 35ms settle -> V down -> 25ms hold -> V up -> 20ms -> LCTRL up via Win32 SendInput.
+        Sends sequenced Ctrl+V via Win32 SendInput ONLY after verifying physical modifiers
+        are released. Returns False honestly on timeout or UIPI block (A3, CB-02, CB-11).
         """
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
 
-        # Critical: wait until physical Ctrl / CapsLock / F9 / F10 are released by user's hand
-        ClipboardInjector.wait_for_modifiers_release(timeout_ms=450, extra_vks=extra_release_vks)
-
-        try:
-            ok1 = _send_key_input(VK_LCONTROL, SCAN_LCTRL, key_up=False)
-            time.sleep(0.035)  # Allow Electron/Chromium input queue to latch ctrlKey=True
-            ok2 = _send_key_input(VK_V, SCAN_V, key_up=False)
-            time.sleep(0.025)
-            ok3 = _send_key_input(VK_V, SCAN_V, key_up=True)
-            time.sleep(0.020)
-            ok4 = _send_key_input(VK_LCONTROL, SCAN_LCTRL, key_up=True)
-            if ok1 and ok2 and ok3 and ok4:
-                return True
-        except Exception as e:
-            logger.warning(f"SendInput Ctrl+V warning, trying keybd_event fallback: {e}")
-
-        # Fallback: Win32 keybd_event with identical safe settle intervals
-        try:
-            user32.keybd_event(VK_LCONTROL, SCAN_LCTRL, 0, 0)
-            time.sleep(0.035)
-            user32.keybd_event(VK_V, SCAN_V, 0, 0)
-            time.sleep(0.025)
-            user32.keybd_event(VK_V, SCAN_V, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.020)
-            user32.keybd_event(VK_LCONTROL, SCAN_LCTRL, KEYEVENTF_KEYUP, 0)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to simulate paste: {e}")
+        released = ClipboardInjector.wait_for_modifiers_release(
+            timeout_ms=450,
+            extra_vks=extra_release_vks,
+            phys_down_checker=phys_down_checker,
+        )
+        if not released:
+            logger.warning("⚠️ Aborting auto-paste: modifier keys still physically held after 450ms.")
             return False
+
+        ctrl_down = _send_key_input(VK_LCONTROL, SCAN_LCTRL, key_up=False)
+        if not ctrl_down:
+            logger.warning(f"⚠️ SendInput(LCTRL down) blocked (WinError={ctypes.get_last_error()}).")
+            return False
+
+        try:
+            time.sleep(PASTE_CTRL_SETTLE_SEC)
+            v_down = _send_key_input(VK_V, SCAN_V, key_up=False)
+            time.sleep(PASTE_V_HOLD_SEC)
+            v_up = _send_key_input(VK_V, SCAN_V, key_up=True)
+            time.sleep(PASTE_V_RELEASE_SETTLE_SEC)
+        finally:
+            ctrl_up = _send_key_input(VK_LCONTROL, SCAN_LCTRL, key_up=True)
+
+        if not (v_down and v_up and ctrl_up):
+            logger.warning(f"⚠️ SendInput(Ctrl+V) incomplete (WinError={ctypes.get_last_error()}).")
+            return False
+        return True
 
     @staticmethod
-    def simulate_enter(delay_ms: int = 100) -> bool:
-        """Simulates Enter key press via Win32 SendInput."""
+    def simulate_enter(delay_ms: int = 300) -> bool:
+        """Simulates Enter key press via Win32 SendInput with honest bool return (A3)."""
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
 
-        try:
-            ok1 = _send_key_input(VK_RETURN, SCAN_ENTER, key_up=False)
-            time.sleep(0.025)
-            ok2 = _send_key_input(VK_RETURN, SCAN_ENTER, key_up=True)
-            if ok1 and ok2:
-                return True
-        except Exception:
-            pass
-
-        try:
-            user32.keybd_event(VK_RETURN, SCAN_ENTER, 0, 0)
-            time.sleep(0.025)
-            user32.keybd_event(VK_RETURN, SCAN_ENTER, KEYEVENTF_KEYUP, 0)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to simulate enter: {e}")
+        ok1 = _send_key_input(VK_RETURN, SCAN_ENTER, key_up=False)
+        if not ok1:
+            logger.warning(f"⚠️ SendInput(Enter down) blocked (WinError={ctypes.get_last_error()}).")
             return False
+        time.sleep(0.025)
+        ok2 = _send_key_input(VK_RETURN, SCAN_ENTER, key_up=True)
+        return bool(ok1 and ok2)
