@@ -231,3 +231,4 @@ imageio-ffmpeg>=0.5.1
     #   font=("Segoe UI", 11, "bold")
     # Waveform bars, dot_r, dot_x, div_x, start_x, min_h, max_h all multiply by s = self._scale.
 ```
+
