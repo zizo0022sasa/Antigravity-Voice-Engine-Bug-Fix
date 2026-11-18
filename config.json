@@ -1,0 +1,36 @@
+{
+  "hotkey": "CTRL+CAPSLOCK, F9, F10",
+  "mode": "smart",
+  "audio_format": "m4a",
+  "bitrate": "64k",
+  "smart_hold_threshold_sec": 0.45,
+  "min_recording_duration_sec": 0.6,
+  "max_recording_duration_sec": 600,
+  "sample_rate": 44100,
+  "channels": 1,
+  "audio_device_index": null,
+  "save_directory": "~/Documents/تسجيلات الصوت",
+  "auto_paste": true,
+  "paste_delay_ms": 150,
+  "auto_send_enter": false,
+  "audio_cues": {
+    "enabled": true,
+    "start_freq": 1200,
+    "start_duration_ms": 90,
+    "stop_freq": 1600,
+    "stop_duration_ms": 120,
+    "cancel_freq": 450,
+    "cancel_duration_ms": 150
+  },
+  "overlay": {
+    "enabled": true,
+    "position": "bottom_center",
+    "offset_y": 50,
+    "width": 260,
+    "height": 44,
+    "show_timer": true,
+    "show_waveform": true,
+    "waveform_bars": 7,
+    "theme": "dark"
+  }
+}

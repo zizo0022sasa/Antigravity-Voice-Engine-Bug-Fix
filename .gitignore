@@ -1,0 +1,20 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Runtime logs & local backups (never commit window titles or backups)
+*.log
+.backup*/
+*.bak
+
+# Local audio recordings
+*.m4a
+*.wav
+*.mp3
+*.ogg
+
+# Local environment overrides
+.env
+config.local.json
