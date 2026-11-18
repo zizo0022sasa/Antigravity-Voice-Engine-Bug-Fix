@@ -113,6 +113,7 @@ class VoiceEngine:
             on_press=self._handle_key_down,
             on_release=self._handle_key_up,
             strict_modifiers=self.config.strict_modifiers,
+            orphan_timeout_sec=float(self.config.max_recording_duration_sec) + 5.0,
         )
         hook_ok = self.listener.start()
 

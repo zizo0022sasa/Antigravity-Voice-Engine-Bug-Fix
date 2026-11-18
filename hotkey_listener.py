@@ -36,6 +36,7 @@ from win32_api import (
     WM_SYSKEYUP,
     WM_QUIT,
     LLKHF_INJECTED,
+    is_input_desktop_accessible,
 )
 
 logger = logging.getLogger("VoiceEngine")
@@ -44,6 +45,8 @@ logger = logging.getLogger("VoiceEngine")
 WATCHDOG_POLL_SEC = 0.035
 HOOK_PROBE_INTERVAL_SEC = 2.0
 HOOK_PROBE_TIMEOUT_SEC = 4.5
+HOOK_REINSTALL_BACKOFF_SEC = 5.0
+DEFAULT_ORPHAN_TIMEOUT_SEC = 305.0
 VK_PROBE_NONAME = 0xFC
 HOOK_PROBE_MAGIC = 0x41475956  # "AGYV"
 
@@ -133,6 +136,7 @@ class _HotkeyRule:
         self.is_mouse: bool = any(vk in MOUSE_VKS for vk in self.vk_codes)
         self.is_active: bool = False
         self.activated_by_hook: bool = False
+        self.activated_time: float = 0.0
         self.caps_initial_state: int = 0
         self.has_caps: bool = (0x14 in self.vk_codes)
 
@@ -179,8 +183,10 @@ class AdaptiveHotkeyListener:
         on_press: Callable[[], None],
         on_release: Callable[[], None],
         strict_modifiers: bool = True,
+        orphan_timeout_sec: float = DEFAULT_ORPHAN_TIMEOUT_SEC,
     ):
         self.strict_modifiers = strict_modifiers
+        self.orphan_timeout_sec = orphan_timeout_sec
         self.on_press = on_press
         self.on_release = on_release
 
@@ -212,6 +218,7 @@ class AdaptiveHotkeyListener:
         now = time.monotonic()
         self._last_probe_sent: float = now
         self._last_probe_ack: float = now
+        self._last_reinstall_attempt: float = 0.0
 
         self._hook_thread: Optional[threading.Thread] = None
         self._worker_thread: Optional[threading.Thread] = None
@@ -287,6 +294,7 @@ class AdaptiveHotkeyListener:
                                 was_any_active = self._any_other_rule_active(rule)
                                 rule.is_active = True
                                 rule.activated_by_hook = True
+                                rule.activated_time = time.monotonic()
                                 suppress = True
                                 if not was_any_active:
                                     self._event_queue.put_nowait("press")
@@ -321,30 +329,37 @@ class AdaptiveHotkeyListener:
         self._hook_thread_id = int(kernel32.GetCurrentThreadId())
         self._hook_proc_ref = HOOKPROC(self._low_level_proc)
         hmod = kernel32.GetModuleHandleW(None)
-        self._hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc_ref, hmod, 0)
-        if self._hook_handle:
+        local_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc_ref, hmod, 0)
+        self._hook_handle = local_hook
+        if local_hook:
             self._last_probe_ack = time.monotonic()
         else:
             err = ctypes.get_last_error()
             logger.error(f"❌ SetWindowsHookExW(WH_KEYBOARD_LL) failed (WinError={err}). Key suppression unavailable.")
         self._hook_ready.set()
 
-        if not self._hook_handle:
+        if not local_hook:
             return
 
-        msg = wintypes.MSG()
-        while self._running:
-            res = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if res <= 0:
-                break
-
-        if self._hook_handle:
-            user32.UnhookWindowsHookEx(self._hook_handle)
-            self._hook_handle = None
+        try:
+            msg = wintypes.MSG()
+            while self._running:
+                res = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if res <= 0:
+                    break
+        finally:
+            # V21-03: Thread only unhooks its own local hook handle to prevent racing with _reinstall_hook()
+            if local_hook:
+                try:
+                    user32.UnhookWindowsHookEx(local_hook)
+                except Exception:
+                    pass
+                if self._hook_handle == local_hook:
+                    self._hook_handle = None
 
     @staticmethod
-    def _send_probe_input() -> None:
-        """Sends neutral VK_NONAME (0xFC) KEYUP tagged with HOOK_PROBE_MAGIC."""
+    def _send_probe_input() -> bool:
+        """Sends neutral VK_NONAME (0xFC) KEYUP tagged with HOOK_PROBE_MAGIC. Returns True if inserted."""
         inp = INPUT(type=INPUT_KEYBOARD)
         inp.union.ki = KEYBDINPUT(
             wVk=VK_PROBE_NONAME,
@@ -353,10 +368,12 @@ class AdaptiveHotkeyListener:
             time=0,
             dwExtraInfo=HOOK_PROBE_MAGIC,
         )
-        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        return bool(sent > 0)
 
     def _reinstall_hook(self) -> bool:
         """Cleanly tears down a dead/timed-out hook thread and installs a fresh WH_KEYBOARD_LL."""
+        self._last_reinstall_attempt = time.monotonic()
         old_tid = self._hook_thread_id
         old_thread = self._hook_thread
         if old_tid:
@@ -403,17 +420,46 @@ class AdaptiveHotkeyListener:
     def _watchdog_tick(self, now_mono: Optional[float] = None) -> None:
         """
         Single deterministic iteration of the companion watchdog (N3):
-          • NEVER releases rules owned by WH_KEYBOARD_LL (HK-11 / A1).
+          • NEVER releases rules owned by WH_KEYBOARD_LL under normal operation (HK-11 / A1).
+          • Reaps orphaned rules if desktop is locked (Secure Desktop / Win+L / UAC) or active duration exceeded (V21-01).
           • Handles mouse buttons and UIPI-elevated windows via GetAsyncKeyState.
-          • Drives the 2.0s idle magic-probe health check when daemon is running (A2).
+          • Drives the 2.0s idle magic-probe health check when daemon is running (A2, V21-02, V21-05).
         """
         now = now_mono if now_mono is not None else time.monotonic()
         any_active = False
 
+        # V21-01: Check desktop accessibility (Win+L / Secure Desktop / UAC)
+        desktop_accessible = is_input_desktop_accessible()
+
         with self._state_lock:
+            if not desktop_accessible:
+                had_active = False
+                for r in self.rules:
+                    if r.is_active:
+                        r.is_active = False
+                        r.activated_by_hook = False
+                        had_active = True
+                self._phys_down.clear()
+                self._suppressed_down.clear()
+                if had_active:
+                    logger.warning("🔒 Secure Desktop active (screen locked / UAC); reaped orphaned hotkey state (V21-01).")
+                    self._event_queue.put_nowait("release")
+                return
+
             for rule in self.rules:
-                # A1 (HK-11): Rules activated by WH_KEYBOARD_LL belong strictly to the hook!
+                # V21-01: Orphan reaper if rule active longer than timeout (e.g. dropped KeyUp)
                 if rule.is_active and rule.activated_by_hook:
+                    if (now - rule.activated_time) > self.orphan_timeout_sec:
+                        logger.warning(
+                            f"⏰ Orphan reaper: rule '{rule.raw_spec}' active for >{self.orphan_timeout_sec:.1f}s without release; forced cleanup (V21-01)."
+                        )
+                        rule.is_active = False
+                        rule.activated_by_hook = False
+                        self._phys_down.clear()
+                        self._suppressed_down.clear()
+                        if not self._any_other_rule_active(rule):
+                            self._event_queue.put_nowait("release")
+                        continue
                     any_active = True
                     continue
 
@@ -427,6 +473,7 @@ class AdaptiveHotkeyListener:
                         rule.caps_initial_state = user32.GetKeyState(0x14) & 1
                     rule.is_active = True
                     rule.activated_by_hook = False
+                    rule.activated_time = now
                     any_active = True
                     if not was_any_active:
                         self._event_queue.put_nowait("press")
@@ -447,12 +494,17 @@ class AdaptiveHotkeyListener:
         # A2: Periodic idle heartbeat probe (only when listener is started)
         if self._running and not any_active:
             if not self.hook_alive or (now - self._last_probe_ack) > HOOK_PROBE_TIMEOUT_SEC:
-                if (now - self._last_probe_sent) >= HOOK_PROBE_INTERVAL_SEC:
+                if (now - self._last_reinstall_attempt) >= HOOK_REINSTALL_BACKOFF_SEC:
                     logger.warning("⚠️ WH_KEYBOARD_LL hook unresponsive or dropped; attempting self-heal...")
                     self._reinstall_hook()
             elif (now - self._last_probe_sent) >= HOOK_PROBE_INTERVAL_SEC:
                 self._last_probe_sent = now
-                self._send_probe_input()
+                probe_sent = self._send_probe_input()
+                if not probe_sent:
+                    # V21-02: SendInput returned 0 (UIPI block or elevated window).
+                    # Treat as ack to avoid false-positive hook reinstall storm.
+                    self._last_probe_ack = now
+                    logger.debug("⚠️ SendInput probe blocked (likely UIPI / elevated window); probe skipped.")
 
     def _watchdog_loop(self):
         while self._running:

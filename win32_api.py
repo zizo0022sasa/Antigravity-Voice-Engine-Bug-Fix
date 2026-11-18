@@ -45,6 +45,7 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
 EVENT_MODIFY_STATE = 0x0002
 WAIT_OBJECT_0 = 0x00000000
+GENERIC_READ = 0x80000000
 
 
 class DROPFILES(ctypes.Structure):
@@ -214,6 +215,10 @@ user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO
 user32.GetMonitorInfoW.restype = wintypes.BOOL
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
+user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+user32.OpenInputDesktop.restype = wintypes.HANDLE
+user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+user32.CloseDesktop.restype = wintypes.BOOL
 
 if hasattr(user32, "GetDpiForSystem"):
     user32.GetDpiForSystem.argtypes = []
@@ -264,3 +269,19 @@ def get_process_exe_name(hwnd: int) -> str:
         return ""
     finally:
         kernel32.CloseHandle(hproc)
+
+
+def is_input_desktop_accessible() -> bool:
+    """
+    Returns False when Windows is on the Secure Desktop (Win+L Lock Screen or UAC prompt),
+    where WH_KEYBOARD_LL hooks do not receive KeyUp events (V21-01).
+    """
+    try:
+        hdesk = user32.OpenInputDesktop(0, False, GENERIC_READ)
+        if not hdesk:
+            return False
+        user32.CloseDesktop(hdesk)
+        return True
+    except Exception:
+        return True
+

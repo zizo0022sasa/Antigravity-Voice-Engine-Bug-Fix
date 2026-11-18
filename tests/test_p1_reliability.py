@@ -178,3 +178,102 @@ def test_sec03_hook_callback_never_logs_ordinary_keystrokes(monkeypatch, caplog)
             listener._low_level_proc(0, hk_mod.WM_KEYUP, ctypes.addressof(kb))
 
     assert caplog.records == []
+
+
+def test_v21_01_desktop_lock_reaps_orphaned_hook_rules(monkeypatch):
+    """V21-01: When input desktop is locked (Win+L / Secure Desktop / UAC), orphaned active rules are reaped."""
+    listener = hk_mod.AdaptiveHotkeyListener("F9", on_press=lambda: None, on_release=lambda: None)
+    monkeypatch.setattr(hk_mod, "is_input_desktop_accessible", lambda: False)
+
+    rule = listener.rules[0]
+    rule.is_active = True
+    rule.activated_by_hook = True
+    listener._phys_down.add(0x78)
+    listener._suppressed_down.add(0x78)
+
+    listener._watchdog_tick(now_mono=100.0)
+
+    assert rule.is_active is False
+    assert rule.activated_by_hook is False
+    assert listener._phys_down == set()
+    assert listener._suppressed_down == set()
+    assert not listener._event_queue.empty()
+    assert listener._event_queue.get_nowait() == "release"
+
+
+def test_v21_01_orphan_timeout_reaps_stalled_hook_rule(monkeypatch):
+    """V21-01: Rule held longer than orphan_timeout_sec without KeyUp is reaped."""
+    listener = hk_mod.AdaptiveHotkeyListener("F9", on_press=lambda: None, on_release=lambda: None, orphan_timeout_sec=10.0)
+    monkeypatch.setattr(hk_mod, "is_input_desktop_accessible", lambda: True)
+
+    rule = listener.rules[0]
+    rule.is_active = True
+    rule.activated_by_hook = True
+    rule.activated_time = 100.0
+    listener._phys_down.add(0x78)
+
+    # Within timeout -> still active
+    listener._watchdog_tick(now_mono=105.0)
+    assert rule.is_active is True
+
+    # Exceeded timeout -> reaped
+    listener._watchdog_tick(now_mono=111.0)
+    assert rule.is_active is False
+    assert rule.activated_by_hook is False
+    assert listener._phys_down == set()
+    assert listener._event_queue.get_nowait() == "release"
+
+
+def test_v21_02_probe_input_blocked_by_uipi_refreshes_ack_preventing_reinstall(monkeypatch):
+    """V21-02: SendInput returning 0 (UIPI block in elevated window) refreshes probe ack, avoiding spurious reinstalls."""
+    listener = hk_mod.AdaptiveHotkeyListener("F9", on_press=lambda: None, on_release=lambda: None)
+    monkeypatch.setattr(hk_mod.AdaptiveHotkeyListener, "hook_alive", property(lambda s: True))
+    monkeypatch.setattr(hk_mod, "is_input_desktop_accessible", lambda: True)
+    monkeypatch.setattr(hk_mod.user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(hk_mod.user32, "SendInput", lambda n, p, s: 0)  # Simulated UIPI block
+
+    reinstall_called = []
+    monkeypatch.setattr(listener, "_reinstall_hook", lambda: reinstall_called.append(1) or True)
+
+    listener._running = True
+    listener._last_probe_sent = 100.0
+    listener._last_probe_ack = 100.0
+
+    # Tick at 102.5s (interval 2.0s reached)
+    listener._watchdog_tick(now_mono=102.5)
+
+    assert listener._last_probe_ack == 102.5
+    assert reinstall_called == []
+    listener._running = False
+
+
+def test_v21_05_reinstall_hook_backoff_throttling(monkeypatch):
+    """V21-05: Failed hook reinstalls obey HOOK_REINSTALL_BACKOFF_SEC before retrying."""
+    listener = hk_mod.AdaptiveHotkeyListener("F9", on_press=lambda: None, on_release=lambda: None)
+    monkeypatch.setattr(hk_mod, "is_input_desktop_accessible", lambda: True)
+    monkeypatch.setattr(hk_mod.user32, "GetAsyncKeyState", lambda vk: 0)
+
+    reinstall_count = []
+
+    def _fake_reinstall():
+        listener._last_reinstall_attempt = time.monotonic()
+        reinstall_count.append(1)
+        return False
+
+    monkeypatch.setattr(listener, "_reinstall_hook", _fake_reinstall)
+
+    listener._running = True
+    listener._last_probe_sent = 100.0
+    listener._last_probe_ack = 90.0  # Expired (> 4.5s)
+    listener._last_reinstall_attempt = 100.0
+
+    # Tick at 102.0s -> backoff (5.0s) not elapsed yet -> no reinstall
+    listener._watchdog_tick(now_mono=102.0)
+    assert reinstall_count == []
+
+    # Tick at 106.0s -> backoff elapsed -> triggers reinstall
+    listener._watchdog_tick(now_mono=106.0)
+    assert len(reinstall_count) == 1
+    listener._running = False
+
+
