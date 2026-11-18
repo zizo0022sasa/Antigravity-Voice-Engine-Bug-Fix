@@ -59,3 +59,4 @@
 - **`R8` (أداة إرسال حدث الإيقاف في `stop_voice.bat`):** استخدام PowerShell القياسي المدمج في ويندوز `[System.Threading.EventWaitHandle]::OpenExisting("Local\AntigravityVoiceEngine_Shutdown").Set()` بدون أي تبعيات خارجية.
 - **`R9` (مطابقة وثيقة الحوكمة مع `DEC-02`):** تم تحديث [`.agents/rules/00-architecture-governance.md`](../.agents/rules/00-architecture-governance.md) بسطر توضيحي يطابق `DEC-02` تماماً.
 - **`R10` (`wait_for_modifiers_release` + `_phys_down`):** مُدمج في `A1` و `T-P0-03`.
+
