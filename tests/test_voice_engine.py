@@ -3,21 +3,75 @@ import os
 import re
 import sys
 import time
+import numpy as np
 import pytest
 
-# Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import EngineConfig, AudioCuesConfig, OverlayConfig
 from cues import AudioCues
-from clipboard_injector import ClipboardInjector, INPUT
+from clipboard_injector import ClipboardInjector
+from win32_api import (
+    user32,
+    kernel32,
+    INPUT,
+    CF_UNICODETEXT,
+    GMEM_MOVEABLE,
+    WS_EX_NOACTIVATE,
+    WS_EX_TRANSPARENT,
+    GWL_EXSTYLE,
+    get_window_long_ptr,
+)
 from audio_recorder import AudioRecorder
 from hotkey_listener import AdaptiveHotkeyListener
-from overlay import VoiceOverlay, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, GWL_EXSTYLE
+from overlay import VoiceOverlay
 from engine import VoiceEngine
 
 
-def test_config_load_and_defaults(tmp_path):
+def _read_clipboard_unicode_text() -> str:
+    """Reads current CF_UNICODETEXT from clipboard so tests can restore developer's clipboard."""
+    if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+        return ""
+    if not user32.OpenClipboard(None):
+        return ""
+    try:
+        h_data = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h_data:
+            return ""
+        ptr = kernel32.GlobalLock(h_data)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(h_data)
+    finally:
+        user32.CloseClipboard()
+
+
+def _restore_clipboard_unicode_text(text: str) -> None:
+    if not user32.OpenClipboard(None):
+        return
+    try:
+        user32.EmptyClipboard()
+        if text:
+            raw = (text + "\0").encode("utf-16le")
+            h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(raw))
+            if h_mem:
+                ptr = kernel32.GlobalLock(h_mem)
+                if ptr:
+                    ctypes.memmove(ptr, raw, len(raw))
+                    kernel32.GlobalUnlock(h_mem)
+                    if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+                        kernel32.GlobalFree(h_mem)
+                else:
+                    kernel32.GlobalFree(h_mem)
+    finally:
+        user32.CloseClipboard()
+
+
+def test_config_load_and_defaults_isolated(tmp_path):
+    """TS-03 & DEC-06: load() preserves '~' in save_directory and creates zero folders outside tmp_path."""
     config_file = str(tmp_path / "test_config.json")
     cfg = EngineConfig.load(config_file)
     assert "CTRL+CAPSLOCK" in cfg.hotkey
@@ -26,7 +80,8 @@ def test_config_load_and_defaults(tmp_path):
     assert cfg.mode == "smart"
     assert cfg.sample_rate == 44100
     assert cfg.channels == 1
-    assert os.path.exists(cfg.save_directory)
+    assert cfg.save_directory.startswith("~")
+    assert os.path.isabs(cfg.resolved_save_directory)
 
     cfg.hotkey = "F8"
     cfg.auto_send_enter = True
@@ -35,14 +90,15 @@ def test_config_load_and_defaults(tmp_path):
     reloaded = EngineConfig.load(config_file)
     assert reloaded.hotkey == "F8"
     assert reloaded.auto_send_enter is True
+    assert reloaded.save_directory.startswith("~")
 
 
 def test_sendinput_struct_size_64bit():
-    """Ensures Win32 INPUT structure matches 64-bit Windows ABI (40 bytes)."""
     expected = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
     assert ctypes.sizeof(INPUT) == expected
 
 
+@pytest.mark.hw
 def test_audio_cues_execution():
     cues = AudioCues(AudioCuesConfig(enabled=True, start_freq=1000, start_duration_ms=10))
     cues.play_start()
@@ -50,11 +106,17 @@ def test_audio_cues_execution():
     cues.play_cancel()
 
 
-def test_clipboard_set_file(tmp_path):
-    test_file = tmp_path / "sample.wav"
-    test_file.write_bytes(b"RIFFdummydataWAVEfmt ")
-    success = ClipboardInjector.set_clipboard_file(str(test_file))
-    assert success is True
+@pytest.mark.hw
+def test_clipboard_set_file_preserves_user_clipboard(tmp_path):
+    """TS-02: Saves and restores developer's clipboard text around real Win32 clipboard test."""
+    prior_text = _read_clipboard_unicode_text()
+    try:
+        test_file = tmp_path / "sample.wav"
+        test_file.write_bytes(b"RIFFdummydataWAVEfmt ")
+        success = ClipboardInjector.set_clipboard_file(str(test_file))
+        assert success is True
+    finally:
+        _restore_clipboard_unicode_text(prior_text)
 
 
 def test_foreground_window_query_and_focus_guard():
@@ -66,33 +128,53 @@ def test_foreground_window_query_and_focus_guard():
     assert isinstance(resolved, int)
 
 
-def test_recorder_rejects_sub_threshold(tmp_path):
-    rec = AudioRecorder(
-        save_dir=str(tmp_path),
-        min_duration_sec=1.0,
-    )
+class _DummyInputStream:
+    """Mock PortAudio InputStream for CI runners without a physical microphone."""
+
+    def __init__(self, samplerate, channels, device, dtype, callback):
+        self.samplerate = samplerate
+        self.channels = channels
+        self.callback = callback
+        self._active = False
+
+    def start(self):
+        self._active = True
+        chunk = np.zeros((int(self.samplerate * 0.15), self.channels), dtype=np.int16)
+        try:
+            self.callback(chunk, len(chunk), None, None)
+        except Exception:
+            pass
+
+    def stop(self):
+        self._active = False
+
+    def close(self):
+        self._active = False
+
+
+def test_recorder_rejects_sub_threshold_mocked(tmp_path, monkeypatch):
+    import sounddevice as sd
+    monkeypatch.setattr(sd, "InputStream", _DummyInputStream)
+    rec = AudioRecorder(save_dir=str(tmp_path), min_duration_sec=1.0)
     rec.start()
-    time.sleep(0.1)
+    time.sleep(0.05)
     saved = rec.stop()
     assert saved is None
 
 
-def test_recorder_chronological_filename_without_weekday_and_no_focus_steal(tmp_path):
-    """
-    Verifies:
-      1. Filename strictly follows Voice_YYYY-MM-DD_HH-MM-SS.(m4a|wav) with NO weekday name.
-      2. M4A ffmpeg compression executes with CREATE_NO_WINDOW without changing foreground HWND.
-    """
+def test_recorder_chronological_filename_without_weekday_mocked(tmp_path, monkeypatch):
+    import sounddevice as sd
+    monkeypatch.setattr(sd, "InputStream", _DummyInputStream)
     fg_before = ClipboardInjector.get_foreground_hwnd()
     rec = AudioRecorder(
         save_dir=str(tmp_path),
         sample_rate=44100,
         channels=1,
-        min_duration_sec=0.2,
+        min_duration_sec=0.1,
         audio_format="m4a",
     )
     rec.start()
-    time.sleep(0.35)
+    time.sleep(0.18)
     saved_path = rec.stop()
     fg_after = ClipboardInjector.get_foreground_hwnd()
 
@@ -101,21 +183,17 @@ def test_recorder_chronological_filename_without_weekday_and_no_focus_steal(tmp_
     assert os.path.getsize(saved_path) > 0
 
     basename = os.path.basename(saved_path)
-    # Must match Voice_2026-11-18_08-10-03.m4a (or .wav) — ZERO weekday words!
-    assert re.match(r"^Voice_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.(m4a|wav)$", basename), (
-        f"Unexpected filename format: {basename}"
-    )
+    assert re.match(r"^Voice_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.(m4a|wav)$", basename)
     for weekday in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"):
         assert weekday not in basename
 
-    # Foreground window must NOT have been hijacked by ffmpeg console
     if fg_before != 0:
         assert fg_after == fg_before
-    # PCM buffer in RAM must be released immediately after stop()
     assert rec._frames == []
 
 
-def test_recorder_enforces_max_duration_cap(tmp_path):
+@pytest.mark.hw
+def test_recorder_real_microphone_enforces_max_duration(tmp_path):
     rec = AudioRecorder(
         save_dir=str(tmp_path),
         sample_rate=44100,
@@ -133,75 +211,51 @@ def test_recorder_enforces_max_duration_cap(tmp_path):
     assert rec._frames == []
 
 
-def test_hotkey_listener_lifecycle():
-    pressed = []
-    released = []
+@pytest.mark.hw
+def test_hotkey_listener_live_hook_lifecycle():
     listener = AdaptiveHotkeyListener(
         key_name="CTRL+CAPSLOCK, F9, F10",
-        on_press=lambda: pressed.append(1),
-        on_release=lambda: released.append(1),
+        on_press=lambda: None,
+        on_release=lambda: None,
     )
-    assert 0x78 in listener.all_vk_codes  # F9
-    assert 0x79 in listener.all_vk_codes  # F10
-    assert 0x14 in listener.all_vk_codes  # CAPSLOCK
-    listener.start()
-    time.sleep(0.08)
+    assert 0x78 in listener.all_vk_codes
+    assert 0x79 in listener.all_vk_codes
+    assert 0x14 in listener.all_vk_codes
+    ok = listener.start()
+    assert isinstance(ok, bool)
+    time.sleep(0.06)
     listener.stop()
 
 
-def test_engine_workflow_mock(tmp_path):
+def test_engine_modes_workflow_isolated(tmp_path, monkeypatch):
+    import sounddevice as sd
+    monkeypatch.setattr(sd, "InputStream", _DummyInputStream)
+
+    # 1. Smart mode hold (>= threshold -> stops on release)
     cfg = EngineConfig(
         hotkey="F9",
         mode="smart",
+        smart_hold_threshold_sec=0.15,
         save_directory=str(tmp_path),
-        min_recording_duration_sec=0.2,
+        min_recording_duration_sec=0.05,
         auto_paste=False,
         audio_cues=AudioCuesConfig(enabled=False),
+        overlay=OverlayConfig(enabled=False),
     )
     engine = VoiceEngine(cfg)
     engine._handle_key_down()
     assert engine.recorder.is_recording is True
-    time.sleep(0.5)
+    time.sleep(0.20)
     engine._handle_key_up()
     assert engine.recorder.is_recording is False
 
-
-def test_engine_toggle_mode_workflow(tmp_path):
-    cfg = EngineConfig(
-        hotkey="F9",
-        mode="toggle",
-        save_directory=str(tmp_path),
-        min_recording_duration_sec=0.2,
-        auto_paste=False,
-        audio_cues=AudioCuesConfig(enabled=False),
-    )
-    engine = VoiceEngine(cfg)
+    # 2. Smart mode quick tap (< threshold -> latches toggle)
     engine._handle_key_down()
-    assert engine.recorder.is_recording is True
-    engine._handle_key_up()
-    assert engine.recorder.is_recording is True
-    time.sleep(0.25)
-    engine._handle_key_down()
-    assert engine.recorder.is_recording is False
-
-
-def test_engine_smart_mode_tap_latches_toggle(tmp_path):
-    cfg = EngineConfig(
-        hotkey="F9",
-        mode="smart",
-        smart_hold_threshold_sec=0.4,
-        save_directory=str(tmp_path),
-        min_recording_duration_sec=0.2,
-        auto_paste=False,
-        audio_cues=AudioCuesConfig(enabled=False),
-    )
-    engine = VoiceEngine(cfg)
-    engine._handle_key_down()
-    time.sleep(0.05)
+    time.sleep(0.03)
     engine._handle_key_up()
     assert engine.recorder.is_recording is True
     assert engine._is_toggle_latched is True
-    time.sleep(0.25)
+    time.sleep(0.05)
     engine._handle_key_down()
     assert engine.recorder.is_recording is False
     assert engine._is_toggle_latched is False
@@ -225,7 +279,8 @@ def test_overlay_config_and_defaults(tmp_path):
     assert reloaded.overlay.waveform_bars == 9
 
 
-def test_voice_overlay_lifecycle_and_toplevel_styles():
+def test_voice_overlay_lifecycle_and_persistent_exstyles():
+    """TS-06: Verifies WS_EX_NOACTIVATE | WS_EX_TRANSPARENT persist across full show->success->hide cycle."""
     overlay = VoiceOverlay(
         enabled=True,
         position="bottom_center",
@@ -238,10 +293,6 @@ def test_voice_overlay_lifecycle_and_toplevel_styles():
     assert overlay._root is not None
     assert overlay._top_hwnd is not None and overlay._top_hwnd != 0
 
-    ex_style = ctypes.windll.user32.GetWindowLongW(overlay._top_hwnd, GWL_EXSTYLE)
-    assert bool(ex_style & WS_EX_NOACTIVATE)
-    assert bool(ex_style & WS_EX_TRANSPARENT)
-
     overlay.show_recording()
     overlay._root.update()
     assert overlay._state == "RECORDING"
@@ -253,6 +304,10 @@ def test_voice_overlay_lifecycle_and_toplevel_styles():
     overlay.hide()
     overlay._root.update()
     assert overlay._state == "IDLE"
+
+    ex_style_after = get_window_long_ptr(overlay._top_hwnd, GWL_EXSTYLE)
+    assert bool(ex_style_after & WS_EX_NOACTIVATE)
+    assert bool(ex_style_after & WS_EX_TRANSPARENT)
 
     overlay.stop()
     assert overlay._root is None

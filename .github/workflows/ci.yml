@@ -1,0 +1,43 @@
+name: Windows CI Matrix
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Pytest (Win64 - Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10", "3.11", "3.12", "3.13" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify zero network/external-STT imports (Governance Gate)
+        shell: pwsh
+        run: |
+          $forbidden = Select-String -Path "*.py" -Pattern "^\s*(import|from)\s+(requests|urllib|httpx|aiohttp|socket|whisper|faster_whisper|openai|google\.genai)"
+          if ($forbidden) {
+            Write-Error "Governance violation detected: $forbidden"
+            exit 1
+          }
+
+      - name: Run isolated unit & Win32 ABI test suite
+        run: pytest -m "not hw" -v

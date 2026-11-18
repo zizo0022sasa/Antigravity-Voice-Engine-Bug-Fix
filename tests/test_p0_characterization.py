@@ -143,8 +143,9 @@ def test_n1_magic_probe_acked_before_injected_and_wrong_magic_ignored(monkeypatc
     listener = hk_mod.AdaptiveHotkeyListener("F9", on_press=lambda: None, on_release=lambda: None)
     monkeypatch.setattr(hk_mod.user32, "CallNextHookEx", lambda h, n, w, l: 0)
 
+    if hasattr(listener, "_last_probe_ack"):
+        listener._last_probe_ack = 0.0
     old_ack = getattr(listener, "_last_probe_ack", 0.0)
-    time.sleep(0.01)
 
     # Wrong magic -> ignored as normal injected event (returns 0, ack unchanged)
     kb_bad, ptr_bad = _make_ll_struct(vk=0xFC, flags=hk_mod.LLKHF_INJECTED, extra=0xDEADBEEF)
