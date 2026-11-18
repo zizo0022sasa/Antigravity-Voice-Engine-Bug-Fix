@@ -4,8 +4,7 @@ Entrypoint — Antigravity Smart Voice Engine.
 =============================================================================
 🔒 IMMUTABLE ARCHITECTURAL & GOVERNANCE RULE (DO NOT MODIFY):
   • Pure-Local Push-to-Talk Audio Recorder & Clipboard (CF_HDROP) File Drop ONLY.
-  • ZERO external Speech-to-Text (STT), Whisper, Gemini APIs, or cloud relays.
-  • Antigravity IDE natively processes attached audio files directly.
+  • ZERO external Speech-to-Text (STT), Whisper, Gemini APIs, or network calls.
 =============================================================================
 """
 
@@ -15,20 +14,15 @@ import sys
 
 
 def _enable_per_monitor_dpi_awareness() -> None:
-    """
-    Enables Per-Monitor v2 DPI awareness BEFORE Tkinter or audio drivers initialize.
-    Prevents 4K / 225% scaling coordinate drift and blurry/tiny overlay rendering.
-    """
+    """Enables Per-Monitor v2 DPI awareness BEFORE Tkinter or audio drivers initialize."""
     if os.name != "nt":
         return
     try:
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4 (Windows 10 1703+ / Windows 11)
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_ssize_t(-4))
         return
     except Exception:
         pass
     try:
-        # PROCESS_PER_MONITOR_DPI_AWARE = 2
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
         return
     except Exception:
@@ -39,24 +33,27 @@ def _enable_per_monitor_dpi_awareness() -> None:
         pass
 
 
-# Must execute at process entry BEFORE importing tkinter/sounddevice
 _enable_per_monitor_dpi_awareness()
 
-# Ensure current script directory is in sys.path and is current working directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 try:
     os.chdir(SCRIPT_DIR)
-except Exception:
+except OSError:
     pass
 
-import signal
 import logging
+from logging.handlers import RotatingFileHandler
+import signal
+
 from config import EngineConfig
 from engine import VoiceEngine
+from win32_api import kernel32
 
-# Ensure safe stdout/stderr handling for pythonw.exe and Windows consoles
+SINGLETON_MUTEX_NAME = "Local\\AntigravityVoiceEngine_SingleInstance"
+SHUTDOWN_EVENT_NAME = "Local\\AntigravityVoiceEngine_Shutdown"
+
 if sys.stdout is not None:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -69,11 +66,17 @@ if sys.stderr is not None:
     except Exception:
         pass
 
-# Setup file + console logging (prevent duplicate handlers on re-import)
+# Setup bounded rotating file logging with read-only directory fallback (SEC-01, REL-01)
 log_path = os.path.join(SCRIPT_DIR, "voice_engine.log")
 root_logger = logging.getLogger()
 if not root_logger.handlers:
-    handlers = [logging.FileHandler(log_path, encoding="utf-8")]
+    handlers = []
+    try:
+        handlers.append(
+            RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        )
+    except OSError:
+        handlers.append(logging.NullHandler())
     if sys.stdout is not None:
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
@@ -83,6 +86,35 @@ if not root_logger.handlers:
         handlers=handlers,
     )
 logger = logging.getLogger("VoiceEngine")
+
+_SINGLETON_MUTEX = None
+_SHUTDOWN_EVENT = None
+
+
+def check_single_instance():
+    """Prevents duplicate instances using 64-bit safe Win32 named mutex."""
+    global _SINGLETON_MUTEX
+    if os.name != "nt":
+        return True
+    mutex = kernel32.CreateMutexW(None, False, SINGLETON_MUTEX_NAME)
+    if not mutex:
+        return True
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        logger.info("ℹ️ Voice Engine is already running in the background. Exiting duplicate.")
+        kernel32.CloseHandle(mutex)
+        return None
+    _SINGLETON_MUTEX = mutex
+    return mutex
+
+
+def create_shutdown_event() -> int:
+    """Creates named Win32 event allowing graceful stop from stop_voice.bat / uninstall (R8)."""
+    global _SHUTDOWN_EVENT
+    if os.name != "nt":
+        return 0
+    evt = kernel32.CreateEventW(None, False, False, SHUTDOWN_EVENT_NAME)
+    _SHUTDOWN_EVENT = evt
+    return int(evt) if evt else 0
 
 
 def print_banner(cfg: EngineConfig):
@@ -94,46 +126,12 @@ def print_banner(cfg: EngineConfig):
         print("=" * 65)
         print(f" • Hotkeys:           [{cfg.hotkey}]")
         print(f" • Mode:              {cfg.mode.upper()} (Smart Hold / Toggle)")
-        print(f" • Audio Archive:     {cfg.save_directory}")
+        print(f" • Audio Archive:     {cfg.resolved_save_directory}")
         print(f" • Auto Paste:        {'ENABLED (Ctrl+V)' if cfg.auto_paste else 'DISABLED'}")
         print(f" • Auto Send (Enter): {'ENABLED' if cfg.auto_send_enter else 'DISABLED'}")
-        print("-" * 65)
-        print(" 💡 Instructions:")
-        print("   1. Go to any Antigravity IDE chat window.")
-        print(f"   2. Press & HOLD or TAP [{cfg.hotkey}] to talk.")
-        print("   3. Finish talking -> Audio attaches automatically into chat!")
-        print("   Press Ctrl+C anytime to exit.")
         print("=" * 65 + "\n")
     except Exception:
         pass
-
-
-_SINGLETON_MUTEX = None
-
-
-def check_single_instance():
-    """Prevents duplicate instances using 64-bit safe Win32 named mutex."""
-    global _SINGLETON_MUTEX
-    if os.name != "nt":
-        return True
-    try:
-        from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
-        k32.CreateMutexW.restype = wintypes.HANDLE
-
-        mutex_name = "Local\\AntigravityVoiceEngine_SingleInstance"
-        mutex = k32.CreateMutexW(None, False, mutex_name)
-        if not mutex:
-            return True
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-            logger.info("ℹ️ Voice Engine is already running in the background. Exiting duplicate.")
-            k32.CloseHandle(mutex)
-            return None
-        _SINGLETON_MUTEX = mutex
-        return mutex
-    except Exception:
-        return True
 
 
 def main():
@@ -141,10 +139,11 @@ def main():
     if not _mutex:
         sys.exit(0)
 
+    shutdown_evt = create_shutdown_event()
     cfg = EngineConfig.load()
     print_banner(cfg)
 
-    engine = VoiceEngine(cfg)
+    engine = VoiceEngine(cfg, shutdown_event_handle=shutdown_evt)
     engine.start()
 
     def signal_handler(sig, frame):
@@ -152,11 +151,13 @@ def main():
         engine.stop()
         sys.exit(0)
 
-    try:
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-    except Exception:
-        pass
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig_val = getattr(signal, sig_name, None)
+        if sig_val is not None:
+            try:
+                signal.signal(sig_val, signal_handler)
+            except Exception:
+                pass
 
     try:
         engine.run_loop()

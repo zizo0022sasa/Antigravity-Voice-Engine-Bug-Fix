@@ -6,15 +6,17 @@ set "OLD_CMD_FILE=%STARTUP_DIR%\AntigravityVoiceEngine.cmd"
 set "ENGINE_DIR=%~dp0"
 if "%ENGINE_DIR:~-1%"=="\" set "ENGINE_DIR=%ENGINE_DIR:~0,-1%"
 
-set "PYTHONW_EXE=%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"
-if not exist "%PYTHONW_EXE%" (
-    for /f "delims=" %%I in ('where pythonw.exe 2^>nul') do (
-        set "PYTHONW_EXE=%%I"
-        goto :found_pyw
-    )
-    set "PYTHONW_EXE=pythonw.exe"
-)
-:found_pyw
+echo Resolving Python 3.10+ interpreter with required audio libraries...
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command ^
+  "$cands = @(); " ^
+  "Get-ChildItem \"$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe\" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { $cands += $_.FullName }; " ^
+  "Get-Command python.exe -All -ErrorAction SilentlyContinue | ForEach-Object { $cands += $_.Source }; " ^
+  "foreach ($py in ($cands | Select-Object -Unique)) { " ^
+  "  $pyw = Join-Path (Split-Path $py) 'pythonw.exe'; " ^
+  "  if (Test-Path $pyw) { & $py -c 'import sounddevice, numpy' 2>$null; if ($LASTEXITCODE -eq 0) { Write-Output $pyw; break } } " ^
+  "}"`) do set "PYTHONW_EXE=%%P"
+
+if "%PYTHONW_EXE%"=="" set "PYTHONW_EXE=pythonw.exe"
 
 if exist "%OLD_CMD_FILE%" del /f /q "%OLD_CMD_FILE%"
 
@@ -31,6 +33,6 @@ wscript.exe "%VBS_FILE%"
 echo.
 echo ========================================================
 echo  SUCCESS: Antigravity Voice Engine is now installed!
-echo  It will launch silently whenever Windows boots.
+echo  Runner: %PYTHONW_EXE%
 echo ========================================================
 timeout /t 3 >nul

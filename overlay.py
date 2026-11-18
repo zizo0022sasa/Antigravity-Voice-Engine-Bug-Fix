@@ -1,72 +1,53 @@
 """
 Floating Voice Capsule Overlay — Antigravity Smart Voice Engine.
 
-Engineered for 4K / High-DPI (100%–300% scaling) and Multi-Monitor setups:
-  • Queries live Win32 MonitorFromWindow + GetMonitorInfoW (rcWork) + GetDpiForMonitor
-    on EVERY show/reposition, so HDMI TV reconnects or DPI changes NEVER misplace the pill.
-  • Scales pill geometry and waveform bars proportionally to the target monitor's DPI
-    while preserving native crisp Tkinter font rendering.
-  • Applies WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT
-    to the true outer Win32 top-level window (GetAncestor(..., GA_ROOT) = TkTopLevel),
-    guaranteeing zero focus theft and full mouse click-through.
+Implements:
+  • Pure UI-thread command queue polled at UI_IDLE_POLL_MS = 50ms (OV-01, R7)
+    eliminating cross-thread root.after() calls.
+  • Live Win32 MonitorFromWindow + GetMonitorInfoW (rcWork) + GetDpiForMonitor
+    using centralized 64-bit prototypes from win32_api (OV-04).
+  • WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT
+    applied to GetAncestor(..., GA_ROOT) (TkTopLevel).
 """
 
-import math
-import random
-import logging
-import threading
-import time
-from typing import Optional, Callable, Tuple
-import tkinter as tk
 import ctypes
 from ctypes import wintypes
+import logging
+import math
+import queue
+import random
+import threading
+import time
+import tkinter as tk
+from typing import Optional, Callable, Tuple
+
+from win32_api import (
+    user32,
+    shcore,
+    MONITORINFO,
+    get_window_long_ptr,
+    set_window_long_ptr,
+    GWL_EXSTYLE,
+    GA_ROOT,
+    WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT,
+    WS_EX_TOOLWINDOW,
+    WS_EX_NOACTIVATE,
+    SW_SHOWNOACTIVATE,
+    MONITOR_DEFAULTTONEAREST,
+    MDT_EFFECTIVE_DPI,
+)
 
 logger = logging.getLogger("VoiceOverlay")
 
-user32 = ctypes.windll.user32
-
-# Win32 Window Styles & Monitor APIs
-GWL_EXSTYLE = -20
-GA_ROOT = 2
-WS_EX_TOPMOST = 0x00000008
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
-SW_SHOWNOACTIVATE = 4
-MONITOR_DEFAULTTONEAREST = 2
-MDT_EFFECTIVE_DPI = 0
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
-    ]
-
-
-user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-user32.GetAncestor.restype = wintypes.HWND
-
-user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-user32.MonitorFromWindow.restype = wintypes.HMONITOR
-
-user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-user32.MonitorFromPoint.restype = wintypes.HMONITOR
-
-user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-user32.GetCursorPos.restype = wintypes.BOOL
-
-user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
-user32.GetMonitorInfoW.restype = wintypes.BOOL
+# Named Engineering Constants (R6, R7)
+UI_IDLE_POLL_MS = 50
+ANIM_FRAME_MS = 35
+SUCCESS_BADGE_MS = 950
 
 
 def _query_active_monitor_workarea_and_scale() -> Tuple[int, int, int, int, float]:
-    """
-    Returns (work_left, work_top, work_right, work_bottom, dpi_scale)
-    for the monitor containing the active window (or cursor fallback).
-    """
+    """Returns (work_left, work_top, work_right, work_bottom, dpi_scale) for active monitor."""
     hmon = None
     fg_hwnd = user32.GetForegroundWindow()
     if fg_hwnd:
@@ -80,17 +61,15 @@ def _query_active_monitor_workarea_and_scale() -> Tuple[int, int, int, int, floa
     try:
         dpi_x = wintypes.UINT(96)
         dpi_y = wintypes.UINT(96)
-        res = ctypes.windll.shcore.GetDpiForMonitor(
-            hmon, MDT_EFFECTIVE_DPI, ctypes.byref(dpi_x), ctypes.byref(dpi_y)
-        )
+        res = shcore.GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
         if res == 0 and dpi_x.value > 0:
             scale = max(1.0, float(dpi_x.value) / 96.0)
-        else:
+        elif hasattr(user32, "GetDpiForSystem"):
             sys_dpi = user32.GetDpiForSystem()
             if sys_dpi > 0:
                 scale = max(1.0, float(sys_dpi) / 96.0)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"DPI query fallback note: {e}")
 
     if hmon:
         mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
@@ -109,16 +88,13 @@ def _query_active_monitor_workarea_and_scale() -> Tuple[int, int, int, int, floa
 
 
 class VoiceOverlay:
-    """
-    Ultra-sleek, High-DPI aware floating pill widget (الكبسولة الشاملة الذكية).
-    Renders real-time animated microphone waveform, timer, and status without stealing focus.
-    """
+    """High-DPI floating pill widget communicating strictly via a thread-safe UI command queue."""
 
     def __init__(
         self,
         enabled: bool = True,
         position: str = "bottom_center",
-        offset_y: int = 36,
+        offset_y: int = 50,
         width: int = 260,
         height: int = 44,
         show_timer: bool = True,
@@ -138,7 +114,6 @@ class VoiceOverlay:
         self.waveform_bars = max(3, min(15, waveform_bars))
         self.theme = theme
 
-        # Effective physical dimensions (dynamically scaled per monitor DPI)
         self._scale: float = 1.0
         self.width: int = width
         self.height: int = height
@@ -151,9 +126,13 @@ class VoiceOverlay:
         self._canvas: Optional[tk.Canvas] = None
         self._hwnd: Optional[int] = None
         self._top_hwnd: Optional[int] = None
-        self._state: str = "IDLE"  # "IDLE", "RECORDING", "SUCCESS"
+        self._ui_thread: Optional[threading.Thread] = None
+        self._ui_queue: "queue.SimpleQueue[Tuple[str, Optional[str]]]" = queue.SimpleQueue()
+
+        self._state: str = "IDLE"
         self._success_text: str = "⚡ تم اللصق!"
 
+        self._poll_timer_id: Optional[str] = None
         self._anim_timer_id: Optional[str] = None
         self._hide_timer_id: Optional[str] = None
 
@@ -162,10 +141,10 @@ class VoiceOverlay:
 
     @property
     def window_hwnds(self) -> Tuple[int, ...]:
-        """Returns HWNDs owned by this overlay so focus guards can ignore them."""
         return tuple(h for h in (self._top_hwnd, self._hwnd) if h)
 
-    def _calc_multipliers(self, count: int):
+    @staticmethod
+    def _calc_multipliers(count: int):
         mid = (count - 1) / 2.0
         multipliers = []
         for i in range(count):
@@ -175,11 +154,11 @@ class VoiceOverlay:
         return multipliers
 
     def init_ui(self):
-        """Initializes the Tkinter root window and canvas."""
         if not self.enabled or self._root is not None:
             return
 
         try:
+            self._ui_thread = threading.current_thread()
             self._root = tk.Tk()
             self._root.title("Antigravity Voice Capsule")
             self._root.overrideredirect(True)
@@ -202,28 +181,58 @@ class VoiceOverlay:
             self._root.update_idletasks()
             self._apply_win32_styles()
             self._reposition()
-            self._ui_thread = threading.current_thread()
+            self._schedule_queue_poll()
         except Exception as e:
             logger.warning(f"⚠️ VoiceOverlay GUI initialization warning: {e}")
             self._root = None
 
+    def _schedule_queue_poll(self):
+        if self._root is not None:
+            self._poll_timer_id = self._root.after(UI_IDLE_POLL_MS, self._poll_ui_queue)
+
+    def _poll_ui_queue(self):
+        self._drain_ui_queue()
+        if self._root is not None:
+            self._schedule_queue_poll()
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                cmd, payload = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if cmd == "show_recording":
+                self._on_show_recording()
+            elif cmd == "show_success":
+                self._success_text = payload or "⚡ تم اللصق!"
+                self._on_show_success()
+            elif cmd == "hide":
+                self._on_hide()
+            elif cmd == "stop":
+                self._on_stop()
+                return
+
+    def _enqueue(self, cmd: str, payload: Optional[str] = None):
+        if not self.enabled and cmd != "stop":
+            return
+        self._ui_queue.put_nowait((cmd, payload))
+        # If invoked synchronously on the UI thread itself (e.g. unit tests), drain immediately
+        if self._root is not None and threading.current_thread() is self._ui_thread:
+            self._drain_ui_queue()
+
     def run_mainloop(self):
-        """Runs the mainloop on the calling thread (main thread)."""
         if not self.enabled:
             return
         if self._root is None:
             self.init_ui()
-        if self._root:
+        if self._root is not None:
             try:
                 self._root.mainloop()
             except Exception as e:
                 logger.debug(f"Mainloop exit note: {e}")
 
     def _apply_win32_styles(self):
-        """
-        Applies WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, and WS_EX_TRANSPARENT
-        directly onto the true outer Win32 top-level window (GA_ROOT / TkTopLevel).
-        """
         if not self._root:
             return
         try:
@@ -233,7 +242,7 @@ class VoiceOverlay:
             self._top_hwnd = top_hwnd
 
             for hwnd in {top_hwnd, child_hwnd}:
-                cur_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                cur_style = get_window_long_ptr(hwnd, GWL_EXSTYLE)
                 new_style = (
                     cur_style
                     | WS_EX_NOACTIVATE
@@ -241,26 +250,21 @@ class VoiceOverlay:
                     | WS_EX_TOPMOST
                     | WS_EX_TRANSPARENT
                 )
-                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+                set_window_long_ptr(hwnd, GWL_EXSTYLE, new_style)
         except Exception as e:
             logger.debug(f"Win32 style application note: {e}")
 
     def _reposition(self):
-        """
-        Dynamically queries live monitor work-area and DPI scaling, resizing and centering
-        the capsule right above the Windows Taskbar (bottom_center).
-        """
         if not self._root or not self._canvas:
             return
 
         w_left, w_top, w_right, w_bottom, scale = _query_active_monitor_workarea_and_scale()
         self._scale = scale
 
-        # Synchronize Tk font scaling with the monitor's exact DPI (dpi / 72.0 points-per-inch)
         try:
             self._root.tk.call("tk", "scaling", (scale * 96.0) / 72.0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Tk scaling note: {e}")
 
         self.width = max(180, int(round(self.base_width * scale)))
         self.height = max(36, int(round(self.base_height * scale)))
@@ -278,14 +282,13 @@ class VoiceOverlay:
         elif pos == "top_center":
             x = w_left + (work_w - self.width) // 2
             y = w_top + self.offset_y
-        else:  # default "bottom_center" (anchored cleanly above Taskbar via rcWork.bottom)
+        else:
             x = w_left + (work_w - self.width) // 2
             y = w_bottom - self.height - self.offset_y
 
         self._root.geometry(f"{self.width}x{self.height}+{x}+{y}")
 
     def _draw_pill_background(self, fill_color="#121317", border_color="#2b2d37"):
-        """Draws a smooth rounded pill container scaled to current DPI."""
         if not self._canvas:
             return
         self._canvas.delete("bg_pill")
@@ -295,18 +298,9 @@ class VoiceOverlay:
         x2, y2 = self.width - pad, self.height - pad
 
         points = [
-            x1 + r, y1,
-            x2 - r, y1,
-            x2, y1,
-            x2, y1 + r,
-            x2, y2 - r,
-            x2, y2,
-            x2 - r, y2,
-            x1 + r, y2,
-            x1, y2,
-            x1, y2 - r,
-            x1, y1 + r,
-            x1, y1,
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
         ]
         self._canvas.create_polygon(
             points,
@@ -317,122 +311,87 @@ class VoiceOverlay:
             tags="bg_pill",
         )
 
-    # ------------------ Thread-Safe Public API ------------------
+    # ------------------ Thread-Safe Public API (Queue-Driven) ------------------
 
     def show_recording(self):
-        if not self.enabled or not self._root:
-            return
-        self._state = "RECORDING"
-        self._root.after(0, self._on_show_recording)
+        self._enqueue("show_recording")
 
     def show_success(self, text: str = "⚡ تم اللصق!"):
-        if not self.enabled or not self._root:
-            return
-        self._state = "SUCCESS"
-        self._success_text = text
-        self._root.after(0, self._on_show_success)
+        self._enqueue("show_success", text)
 
     def hide(self):
-        if not self.enabled or not self._root:
-            return
-        self._state = "IDLE"
-        self._root.after(0, self._on_hide)
+        self._enqueue("hide")
 
     def stop(self):
-        if self._root:
+        if self._root is not None:
+            self._enqueue("stop")
+
+    # ------------------ UI-Thread Internal Handlers ------------------
+
+    def _cancel_timer(self, attr_name: str):
+        tid = getattr(self, attr_name, None)
+        if tid and self._root is not None:
             try:
-                if threading.current_thread() == getattr(self, "_ui_thread", None):
-                    self._on_stop()
-                else:
-                    self._root.after(0, self._on_stop)
+                self._root.after_cancel(tid)
             except Exception:
                 pass
-
-    # ------------------ Internal Handlers ------------------
+        setattr(self, attr_name, None)
 
     def _on_show_recording(self):
         if not self._root or not self._canvas:
             return
 
-        if self._hide_timer_id:
-            try:
-                self._root.after_cancel(self._hide_timer_id)
-            except Exception:
-                pass
-            self._hide_timer_id = None
+        self._cancel_timer("_hide_timer_id")
+        self._cancel_timer("_anim_timer_id")
 
         self._state = "RECORDING"
         self._reposition()
         self._apply_win32_styles()
         self._current_bar_heights = [4.0 * self._scale] * self.waveform_bars
 
-        # Show window without stealing keyboard focus
         self._root.deiconify()
-        try:
-            target = self._top_hwnd or self._hwnd
-            if target:
-                user32.ShowWindow(target, SW_SHOWNOACTIVATE)
-        except Exception:
-            pass
+        target = self._top_hwnd or self._hwnd
+        if target:
+            user32.ShowWindow(target, SW_SHOWNOACTIVATE)
 
-        if self._anim_timer_id:
-            try:
-                self._root.after_cancel(self._anim_timer_id)
-            except Exception:
-                pass
         self._render_recording_frame()
 
     def _on_show_success(self):
         if not self._root or not self._canvas:
             return
 
-        if self._anim_timer_id:
-            try:
-                self._root.after_cancel(self._anim_timer_id)
-            except Exception:
-                pass
-            self._anim_timer_id = None
+        self._cancel_timer("_anim_timer_id")
+        self._cancel_timer("_hide_timer_id")
 
         self._state = "SUCCESS"
-        self._render_success_frame()
+        self._reposition()
+        self._apply_win32_styles()
+        self._root.deiconify()
+        target = self._top_hwnd or self._hwnd
+        if target:
+            user32.ShowWindow(target, SW_SHOWNOACTIVATE)
 
-        if self._hide_timer_id:
-            try:
-                self._root.after_cancel(self._hide_timer_id)
-            except Exception:
-                pass
-        self._hide_timer_id = self._root.after(950, self._on_hide)
+        self._render_success_frame()
+        self._hide_timer_id = self._root.after(SUCCESS_BADGE_MS, self._on_hide)
 
     def _on_hide(self):
         if not self._root:
             return
-
-        if self._anim_timer_id:
-            try:
-                self._root.after_cancel(self._anim_timer_id)
-            except Exception:
-                pass
-            self._anim_timer_id = None
-
-        if self._hide_timer_id:
-            try:
-                self._root.after_cancel(self._hide_timer_id)
-            except Exception:
-                pass
-            self._hide_timer_id = None
-
+        self._cancel_timer("_anim_timer_id")
+        self._cancel_timer("_hide_timer_id")
         self._state = "IDLE"
         self._root.withdraw()
 
     def _on_stop(self):
         if not self._root:
             return
+        self._cancel_timer("_poll_timer_id")
         self._on_hide()
         try:
             self._root.quit()
             self._root.destroy()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Overlay destroy note: {e}")
         self._root = None
         self._state = "IDLE"
 
@@ -447,9 +406,8 @@ class VoiceOverlay:
         self._draw_pill_background(fill_color="#121317", border_color="#2c2e39")
 
         cy = self.height / 2.0
-        now = time.time()
+        now = time.monotonic()
 
-        # 1. Pulsing Red Recording Dot
         pulse = (math.sin(now * 5.0) + 1.0) / 2.0
         dot_r = (4.2 + (pulse * 1.5)) * s
         dot_color = "#ff2247" if pulse > 0.3 else "#a3132c"
@@ -459,7 +417,6 @@ class VoiceOverlay:
             fill=dot_color, outline="", tags="dot",
         )
 
-        # 2. Timer Text (font points scale via Tk DPI scaling automatically)
         duration_sec = 0.0
         if self.duration_source:
             try:
@@ -479,14 +436,12 @@ class VoiceOverlay:
             tags="timer",
         )
 
-        # 3. Subtle Divider
         div_x = 108.0 * s
         self._canvas.create_line(
             div_x, cy - 9.0 * s, div_x, cy + 9.0 * s,
             fill="#323542", width=max(1.0, 1.2 * s), tags="divider",
         )
 
-        # 4. Live Equalizer Waveform Bars
         cur_level = 0.0
         if self.level_source:
             try:
@@ -534,7 +489,7 @@ class VoiceOverlay:
             )
 
         if self._state == "RECORDING" and self._root:
-            self._anim_timer_id = self._root.after(35, self._render_recording_frame)
+            self._anim_timer_id = self._root.after(ANIM_FRAME_MS, self._render_recording_frame)
 
     def _render_success_frame(self):
         if not self._canvas:
